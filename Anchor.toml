@@ -1,0 +1,25 @@
+[features]
+seeds = false
+skip-lint = false
+
+[programs.localnet]
+mode_registry = "ModeReg111111111111111111111111111111111111"
+collateral_vault = "CoVau1t111111111111111111111111111111111111"
+session_escrow = "SessEsc111111111111111111111111111111111111"
+staking_rewards = "StakeRwd11111111111111111111111111111111111"
+
+[programs.devnet]
+mode_registry = "ModeReg111111111111111111111111111111111111"
+collateral_vault = "CoVau1t111111111111111111111111111111111111"
+session_escrow = "SessEsc111111111111111111111111111111111111"
+staking_rewards = "StakeRwd11111111111111111111111111111111111"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"

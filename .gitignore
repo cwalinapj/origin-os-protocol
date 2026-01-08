@@ -1,0 +1,14 @@
+# Anchor/Solana
+target/
+.anchor/
+node_modules/
+dist/
+.DS_Store
+
+# Test artifacts
+test-ledger/
+*.log
+
+# Environment
+.env
+.env.*
