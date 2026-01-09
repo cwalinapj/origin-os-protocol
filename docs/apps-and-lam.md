@@ -198,8 +198,9 @@ import * as anchor from "@coral-xyz/anchor";
 async function handleFindProviders(args: any) {
   const { location, minCapacity } = args;
   
-  // Connect to Solana
-  const connection = new Connection("https://api.devnet.solana.com");
+  // Connect to Solana (use environment variable for network configuration)
+  const rpcUrl = process.env.SOLANA_RPC_URL || "https://api.devnet.solana.com";
+  const connection = new Connection(rpcUrl);
   const program = anchor.workspace.CollateralVault;
   
   // Fetch all provider positions
@@ -282,8 +283,10 @@ async function handleBuildOpenSessionTx(args: any) {
   const user = new PublicKey(userPubkey);
   const providerKey = new PublicKey(provider);
   
-  // Generate a nonce for this session (in practice, fetch from user's account)
-  const nonce = Date.now(); // Or use an incrementing counter from on-chain state
+  // Generate a nonce for this session
+  // NOTE: In production, fetch the user's current nonce from an on-chain counter
+  // to prevent collisions. Date.now() is shown here for simplicity only.
+  const nonce = Date.now();
   
   // Derive PDAs
   const [sessionPda] = await PublicKey.findProgramAddress(
@@ -370,8 +373,9 @@ function OriginWidget() {
     // Request signature
     const signed = await signTransaction(tx);
     
-    // Send to network
-    const connection = new Connection('https://api.devnet.solana.com');
+    // Send to network (use environment variable for network configuration)
+    const rpcUrl = process.env.REACT_APP_SOLANA_RPC_URL || 'https://api.devnet.solana.com';
+    const connection = new Connection(rpcUrl);
     const signature = await connection.sendRawTransaction(signed.serialize());
     
     // Wait for confirmation
