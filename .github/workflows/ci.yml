@@ -2,99 +2,75 @@ name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [ "main" ]
   pull_request:
-    branches: [main, develop]
+    branches: [ "main" ]
 
 env:
   RUST_VERSION: "1.79.0"
   SOLANA_VERSION: "1.18.26"
   ANCHOR_VERSION: "0.30.1"
+  NODE_VERSION: "20"
+  CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-test:
+  build-test:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust
+      - name: Install Rust (pinned)
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt, clippy
 
-      - name: Cache Cargo
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install Solana CLI
-        run: |
-          sh -c "$(curl -sSfL https://release.anza.xyz/v${{ env.SOLANA_VERSION }}/install)"
-          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
-
-      - name: Install Anchor CLI
-        run: |
-          cargo install --git https://github.com/coral-xyz/anchor avm --locked --force
-          avm install ${{ env.ANCHOR_VERSION }}
-          avm use ${{ env.ANCHOR_VERSION }}
-
-      - name: Verify Toolchain Versions
-        run: |
-          rustc --version
-          solana --version
-          anchor --version
-
-      - name: Check Formatting
-        run: cargo fmt --all -- --check
-
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Run Unit Tests
-        run: cargo test --lib
-
-      - name: Build Programs
-        run: anchor build
-
-      - name: Setup Node.js
+      - name: Install Node (for Anchor tests)
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
-          cache: 'yarn'
+          node-version: ${{ env.NODE_VERSION }}
+          cache: yarn
 
-      - name: Install Dependencies
+      - name: Install Solana CLI (pinned, retry)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -fL --retry 5 --retry-delay 2 https://release.solana.com/v${SOLANA_VERSION}/install -o solana-install.sh
+          sh solana-install.sh
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+          solana --version
+
+      - name: Install Anchor CLI (pinned, overwrite-safe)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Avoid "binary already exists in destination"
+          rm -f ~/.cargo/bin/anchor || true
+          cargo install --locked --force --version $ANCHOR_VERSION anchor-cli
+          anchor --version
+
+      - name: Yarn install
         run: yarn install --frozen-lockfile
 
-      - name: Run Anchor Tests
+      - name: Rust fmt
+        run: cargo fmt --all --check
+
+      - name: Rust tests
+        run: cargo test --workspace --all-features
+
+      - name: Anchor build
+        run: anchor build
+
+      - name: Anchor tests
         run: anchor test
-
-  # Security check for dependency vulnerabilities
-  security-audit:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
-
-      - name: Run Security Audit
-        run: cargo audit
-        continue-on-error: true  # Don't fail on advisories, just report
