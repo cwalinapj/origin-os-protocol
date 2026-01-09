@@ -93,7 +93,76 @@ pub mod staking_rewards {
         Ok(())
     }
 
-    /// Initialize the staking pool
+    // ========================================================================
+    // Native Staking Instructions (naked staking without NFT)
+    // ========================================================================
+
+    /// Initialize native stake pool
+    pub fn init_native_pool(
+        ctx: Context<InitNativePool>,
+        discount_bps: u16,
+        max_staleness_slots: u64,
+        min_stake_duration_slots: u64,
+        deposit_cap: u64,
+    ) -> Result<()> {
+        require!(discount_bps <= MAX_BPS, ErrorCode::InvalidDiscount);
+
+        let pool = &mut ctx.accounts.native_pool;
+        let clock = Clock::get()?;
+
+        pool.authority = ctx.accounts.authority.key();
+        pool.emission_controller = ctx.accounts.emission_controller.key();
+        pool.native_mint = ctx.accounts.native_mint.key();
+        pool.reward_mint = ctx.accounts.reward_mint.key();
+        pool.vault = ctx.accounts.vault.key();
+        pool.pyth_feed = ctx.accounts.pyth_feed.key();
+        pool.discount_bps = discount_bps;
+        pool.max_staleness_slots = max_staleness_slots;
+        pool.min_stake_duration_slots = min_stake_duration_slots;
+        pool.deposit_cap = deposit_cap;
+        pool.total_staked = 0;
+        pool.total_weight = 0;
+        pool.reward_per_share = 0;
+        pool.last_update_slot = clock.slot;
+        pool.paused = false;
+        pool.bump = ctx.bumps.native_pool;
+
+        emit!(NativePoolInitialized {
+            authority: pool.authority,
+            native_mint: pool.native_mint,
+            pyth_feed: pool.pyth_feed,
+            discount_bps,
+        });
+
+        Ok(())
+    }
+
+    /// Pause/unpause native pool (authority only)
+    pub fn set_native_pool_paused(
+        ctx: Context<UpdateNativePool>,
+        paused: bool,
+    ) -> Result<()> {
+        ctx.accounts.native_pool.paused = paused;
+        emit!(NativePoolPausedUpdated { paused });
+        Ok(())
+    }
+
+    /// Update native pool discount (authority only)
+    pub fn update_native_discount(
+        ctx: Context<UpdateNativePool>,
+        discount_bps: u16,
+    ) -> Result<()> {
+        require!(discount_bps <= MAX_BPS, ErrorCode::InvalidDiscount);
+        let old_discount = ctx.accounts.native_pool.discount_bps;
+        ctx.accounts.native_pool.discount_bps = discount_bps;
+        emit!(NativeDiscountUpdated {
+            old_discount_bps: old_discount,
+            new_discount_bps: discount_bps,
+        });
+        Ok(())
+    }
+
+    /// Initialize the staking pool (NFT-based)
     pub fn initialize_pool(ctx: Context<InitializePool>) -> Result<()> {
         let pool = &mut ctx.accounts.pool;
         pool.authority = ctx.accounts.authority.key();
@@ -441,6 +510,68 @@ pub struct UpdateEmissionController<'info> {
     pub authority: Signer<'info>,
 }
 
+// ============================================================================
+// Native Staking Contexts
+// ============================================================================
+
+#[derive(Accounts)]
+pub struct InitNativePool<'info> {
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + NativeStakePool::INIT_SPACE,
+        seeds = [b"native_pool"],
+        bump
+    )]
+    pub native_pool: Account<'info, NativeStakePool>,
+
+    #[account(
+        seeds = [b"emission_controller"],
+        bump = emission_controller.bump
+    )]
+    pub emission_controller: Account<'info, EmissionController>,
+
+    pub native_mint: Account<'info, Mint>,
+    pub reward_mint: Account<'info, Mint>,
+
+    /// Vault to hold staked tokens
+    #[account(
+        init,
+        payer = authority,
+        token::mint = native_mint,
+        token::authority = native_pool,
+        seeds = [b"native_vault"],
+        bump
+    )]
+    pub vault: Account<'info, TokenAccount>,
+
+    /// CHECK: Pyth price feed account
+    pub pyth_feed: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateNativePool<'info> {
+    #[account(
+        mut,
+        seeds = [b"native_pool"],
+        bump = native_pool.bump,
+        has_one = authority @ ErrorCode::Unauthorized
+    )]
+    pub native_pool: Account<'info, NativeStakePool>,
+
+    pub authority: Signer<'info>,
+}
+
+// ============================================================================
+// NFT Staking Contexts
+// ============================================================================
+
 #[derive(Accounts)]
 pub struct InitializePool<'info> {
     #[account(
@@ -647,6 +778,45 @@ pub struct CollateralPosition {
 }
 
 // ============================================================================
+// Native Staking State (naked staking without NFT)
+// ============================================================================
+
+#[account]
+#[derive(InitSpace)]
+pub struct NativeStakePool {
+    pub authority: Pubkey,
+    pub emission_controller: Pubkey,    // Link to EmissionController
+    pub native_mint: Pubkey,            // ORIGIN token to stake
+    pub reward_mint: Pubkey,            // Reward token (usually same)
+    pub vault: Pubkey,                  // Token account holding staked tokens
+    pub pyth_feed: Pubkey,              // Price oracle for USD weight
+    pub discount_bps: u16,              // e.g. 8000 = 80% weight vs NFT
+    pub max_staleness_slots: u64,       // Pyth freshness requirement
+    pub min_stake_duration_slots: u64,  // Flash loan protection
+    pub deposit_cap: u64,               // Max total staked tokens
+    pub total_staked: u64,              // Raw token amount
+    pub total_weight: u128,             // USD-weighted sum
+    pub reward_per_share: u128,         // Accumulator (1e12 precision)
+    pub last_update_slot: u64,
+    pub paused: bool,
+    pub bump: u8,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct NativeStakePosition {
+    pub owner: Pubkey,
+    pub pool: Pubkey,
+    pub amount: u64,                    // Raw staked tokens
+    pub weight: u128,                   // USD-weighted amount
+    pub reward_debt: u128,              // MasterChef debt
+    pub pending_rewards: u128,          // Unclaimed rewards
+    pub staked_at_slot: u64,            // When first staked
+    pub unlock_slot: u64,               // staked_at + min_duration
+    pub bump: u8,
+}
+
+// ============================================================================
 // Events
 // ============================================================================
 
@@ -670,6 +840,27 @@ pub struct EmissionPausedUpdated {
     pub paused: bool,
 }
 
+// Native Pool Events
+#[event]
+pub struct NativePoolInitialized {
+    pub authority: Pubkey,
+    pub native_mint: Pubkey,
+    pub pyth_feed: Pubkey,
+    pub discount_bps: u16,
+}
+
+#[event]
+pub struct NativePoolPausedUpdated {
+    pub paused: bool,
+}
+
+#[event]
+pub struct NativeDiscountUpdated {
+    pub old_discount_bps: u16,
+    pub new_discount_bps: u16,
+}
+
+// NFT Pool Events
 #[event]
 pub struct PoolInitialized {
     pub authority: Pubkey,
@@ -722,4 +913,8 @@ pub enum ErrorCode {
     Unauthorized,
     #[msg("Emissions paused")]
     EmissionsPaused,
+    #[msg("Invalid discount: must be <= 10000 bps")]
+    InvalidDiscount,
+    #[msg("Pool is paused")]
+    PoolPaused,
 }

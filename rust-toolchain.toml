@@ -1,7 +1,7 @@
 # Rust toolchain configuration for Origin OS Protocol
-# Anchor 0.30.1 + Solana 1.18.x requires Rust 1.79.0
+# Updated for edition2024 support
 
 [toolchain]
-channel = "1.79.0"
+channel = "1.85.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
