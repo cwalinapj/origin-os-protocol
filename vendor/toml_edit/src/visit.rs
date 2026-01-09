@@ -79,7 +79,7 @@ use crate::{
     Value,
 };
 
-/// Document tree traversal to mutate an exclusive borrow of a document tree in-place.
+/// Document tree traversal over an immutable view of a document tree.
 ///
 /// See the [module documentation](self) for details.
 pub trait Visit<'doc> {
