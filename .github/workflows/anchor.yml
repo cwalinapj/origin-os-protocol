@@ -1,0 +1,60 @@
+name: Anchor Tests
+
+on:
+  pull_request:
+    branches: ["main"]
+  push:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  anchor-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- System deps commonly needed for Solana/Anchor builds on Linux
+      # (Solana docs and many setups require these on Ubuntu)
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config build-essential libudev-dev libssl-dev
+
+      # --- Rust (match your repo pin; keep consistent with rust-toolchain.toml policy)
+      - uses: dtolnay/rust-toolchain@1.79.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # --- Node (Anchor TS tests)
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install JS deps
+        run: npm ci
+
+      # --- Solana CLI (Anchor 0.30.1 recommends Solana 1.18.17)
+      - name: Install Solana CLI
+        run: |
+          sh -c "$(curl -sSfL https://release.solana.com/v1.18.17/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+          solana --version
+
+      # --- Anchor CLI via AVM (recommended by Anchor docs)
+      - name: Install AVM + Anchor CLI (0.30.1)
+        run: |
+          cargo install --git https://github.com/coral-xyz/anchor avm --force
+          avm install 0.30.1
+          avm use 0.30.1
+          anchor --version
+
+      # --- Run Anchor tests (starts local validator automatically on localnet)
+      - name: Anchor test
+        run: anchor test
