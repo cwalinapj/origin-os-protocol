@@ -1,0 +1,75 @@
+name: Anchor Tests
+
+on:
+  pull_request:
+    branches: ["main"]
+  push:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  anchor-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Linux deps commonly needed for Solana/Anchor toolchains
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config build-essential libudev-dev libssl-dev
+
+      # Rust pinned (matches your rust-toolchain.toml policy)
+      - uses: dtolnay/rust-toolchain@1.79.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      # Node for TS tests; enable Yarn caching
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: "yarn"
+          cache-dependency-path: "yarn.lock"
+      # setup-node supports cache: 'yarn' (and you can point it at yarn.lock)  [oai_citation:1‡GitHub](https://github.com/actions/setup-node?utm_source=chatgpt.com)
+
+      - name: Enable Corepack (Yarn)
+        run: |
+          corepack enable
+          yarn --version
+
+      - name: Install JS deps
+        run: |
+          # Prefer reproducible installs if yarn.lock exists
+          if [ -f yarn.lock ]; then
+            yarn install --frozen-lockfile
+          else
+            echo "WARNING: yarn.lock not found; consider committing it for reproducible CI."
+            yarn install
+          fi
+
+      # Solana CLI pinned: install tool supports specifying a release tag
+      - name: Install Solana CLI (pinned)
+        run: |
+          sh -c "$(curl -sSfL https://release.solana.com/v1.18.26/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+          solana --version
+      # Solana docs show install via release.solana.com/<version>/install and note you can replace the version tag.  [oai_citation:2‡Solana Validator](https://docs.solanalabs.com/cli/install?utm_source=chatgpt.com)
+
+      # Anchor CLI via AVM (pin to 0.30.1)
+      - name: Install AVM + Anchor CLI (0.30.1)
+        run: |
+          cargo install --git https://github.com/coral-xyz/anchor avm --force
+          avm install 0.30.1
+          avm use 0.30.1
+          anchor --version
+      # AVM commands (install/use) are documented here.  [oai_citation:3‡Anchor Language](https://www.anchor-lang.com/docs/references/avm?utm_source=chatgpt.com)
+
+      # Runs your Anchor.toml scripts.test (yarn ts-mocha...) and auto-starts local validator on localnet
+      - name: Anchor test
+        run: anchor test
+      # anchor test behavior (deploy + run integration tests; auto-start localnet validator) is documented here.  [oai_citation:4‡Anchor Language](https://www.anchor-lang.com/docs/references/cli?utm_source=chatgpt.com)

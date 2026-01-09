@@ -1,10 +1,10 @@
-name: Rust
+name: Rust CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -12,10 +12,8 @@ env:
   ANCHOR_VERSION: "0.30.1"
 
 jobs:
-  build:
-
+  rust:
     runs-on: ubuntu-latest
-
     steps:
     - uses: actions/checkout@v4
 

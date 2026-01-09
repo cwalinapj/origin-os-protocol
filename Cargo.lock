@@ -1945,6 +1945,7 @@ dependencies = [
  "anchor-lang",
  "anchor-spl",
  "collateral_vault",
+ "mode_registry",
 ]
 
 [[package]]
