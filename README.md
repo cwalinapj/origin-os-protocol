@@ -148,12 +148,19 @@ distribution:
   treasury: 10%
 ```
 
-## Build
+## Toolchain Requirements
+
+| Component | Version |
+|-----------|---------|
+| Rust | 1.79.0 (pinned in `rust-toolchain.toml`) |
+| Anchor | 0.30.1 |
+| Solana CLI | 1.18.26 |
+
+See [BUILD.md](BUILD.md) for detailed setup and installation instructions.
+
+## Quick Start
 
 ```bash
-# Install Anchor
-cargo install --git https://github.com/coral-xyz/anchor anchor-cli
-
 # Build all programs
 anchor build
 
