@@ -177,7 +177,8 @@ pub mod mode_registry {
             );
         }
 
-        registry.verifiers[registry.verifier_count as usize] = verifier;
+        let idx = registry.verifier_count as usize;
+        registry.verifiers[idx] = verifier;
         registry.verifier_count = registry.verifier_count.checked_add(1).unwrap();
 
         emit!(VerifierAdded { verifier });
@@ -205,7 +206,8 @@ pub mod mode_registry {
         }
 
         // Clear the last slot
-        registry.verifiers[registry.verifier_count as usize - 1] = Pubkey::default();
+        let idx = registry.verifier_count as usize - 1;
+        registry.verifiers[idx] = Pubkey::default();
         registry.verifier_count = registry.verifier_count.checked_sub(1).unwrap();
 
         emit!(VerifierRemoved { verifier });

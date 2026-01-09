@@ -55,6 +55,11 @@ pub mod session_escrow {
         bandwidth_min_chunks: u32,
         sla_warmup_slots: u64,
         sla_window_slots: u64,
+        // Bucketed SLA parameters (only used if is_bid)
+        bucket_slots: u64,
+        terminate_window_slots: u64,
+        max_penalty_bps: u16,
+        verifier_pubkey: Pubkey,
     ) -> Result<()> {
         let clock = Clock::get()?;
 
@@ -148,9 +153,44 @@ pub mod session_escrow {
         session.sla_failure_reason = SlaFailureReason::None;
         session.latency_attested = false;
 
-        // Nonce tracking for bandwidth SLA
+        // Nonce tracking for bandwidth SLA (legacy window-level)
         session.nonce_at_window_start = 0;
         session.nonce_at_window_end = 0;
+
+        // Bucketed SLA configuration (compute if is_bid)
+        if is_bid && bucket_slots > 0 {
+            let buckets_total_computed = compute_buckets_total(sla_window_slots, bucket_slots)?;
+            let bucket_penalty_computed = compute_bucket_penalty(
+                total_reserve,
+                max_penalty_bps,
+                buckets_total_computed,
+            )?;
+            session.bucket_slots = bucket_slots;
+            session.buckets_total = buckets_total_computed;
+            session.bucket_penalty = bucket_penalty_computed;
+        } else {
+            session.bucket_slots = 0;
+            session.buckets_total = 0;
+            session.bucket_penalty = 0;
+        }
+
+        // Bucketed downtime tracking (initialized to zero)
+        session.buckets_failed = 0;
+        session.buckets_failed_bitmap = [0u8; 128];
+
+        // Termination window
+        session.first_violation_slot = 0;
+        session.terminate_window_slots = terminate_window_slots;
+        session.terminate_deadline_slot = 0;
+
+        // Penalty accounting
+        session.penalty_accrued = 0;
+
+        // Attester configuration
+        session.verifier_pubkey = verifier_pubkey;
+
+        // Convenience flags
+        session.terminated_for_cause = false;
 
         emit!(SessionOpened {
             session: session_key,
@@ -246,6 +286,7 @@ pub mod session_escrow {
     /// Snapshot the nonce at SLA window start (callable by anyone after window starts)
     pub fn snapshot_window_start(ctx: Context<SnapshotWindowStart>) -> Result<()> {
         let clock = Clock::get()?;
+        let session_key = ctx.accounts.session.key();
         let session = &mut ctx.accounts.session;
 
         require!(session.is_bid, ErrorCode::NotBidSession);
@@ -256,7 +297,7 @@ pub mod session_escrow {
         session.nonce_at_window_start = session.next_permit_nonce;
 
         emit!(SlaWindowStartSnapshotted {
-            session: ctx.accounts.session.key(),
+            session: session_key,
             nonce_at_start: session.nonce_at_window_start,
             slot: clock.slot,
         });
@@ -781,11 +822,551 @@ pub mod session_escrow {
 
         Ok(())
     }
+
+    // =========================================================================
+    // BUCKETED SLA INSTRUCTIONS (Phase 1: Latency + PrivacyMode only)
+    // =========================================================================
+
+    /// Report a bucket failure (latency or privacy mode violation)
+    ///
+    /// Requires Ed25519 signature verification via Instructions sysvar.
+    /// The Ed25519 precompile instruction must immediately precede this instruction.
+    ///
+    /// Effects:
+    /// - First failure: sets first_violation_slot, terminate_deadline_slot, sla_status = Violated
+    /// - Sets bucket bit in bitmap (idempotent protection)
+    /// - Increments buckets_failed counter
+    /// - Combines failure reason
+    pub fn report_bucket_failure(
+        ctx: Context<ReportBucketFailure>,
+        bucket_index: u64,
+        bucket_start_slot: u64,
+        failure_reason: SlaFailureReason,
+    ) -> Result<()> {
+        let clock = Clock::get()?;
+        let now = clock.slot;
+        let session_key = ctx.accounts.session.key();
+        let session = &mut ctx.accounts.session;
+
+        // === Status guards ===
+        require!(session.is_bid, ErrorCode::NotBidSession);
+        require!(session.state == SessionState::Active, ErrorCode::SessionNotActive);
+        require!(
+            session.sla_status == SlaStatus::Pending || session.sla_status == SlaStatus::Violated,
+            ErrorCode::SlaAlreadyEvaluated
+        );
+
+        // === Window bounds ===
+        require!(
+            now >= session.sla_window_start_slot && now <= session.sla_window_end_slot,
+            ErrorCode::ReportOutsideSlaWindow
+        );
+
+        // === Termination deadline (if already violated) ===
+        if session.sla_status == SlaStatus::Violated {
+            require!(
+                now <= session.terminate_deadline_slot,
+                ErrorCode::ReportAfterDeadline
+            );
+        }
+
+        // === Bucket bounds ===
+        require!(bucket_index < session.buckets_total, ErrorCode::BucketIndexOutOfBounds);
+
+        // === Bucket alignment ===
+        let expected_bucket_start = checked_bucket_start(
+            session.sla_window_start_slot,
+            bucket_index,
+            session.bucket_slots,
+        ).ok_or(ErrorCode::Overflow)?;
+        require!(bucket_start_slot == expected_bucket_start, ErrorCode::BucketSlotMismatch);
+
+        // === Attester auth ===
+        require!(
+            ctx.accounts.verifier.key() == session.verifier_pubkey,
+            ErrorCode::InvalidAttester
+        );
+
+        // === Ed25519 signature verification via Instructions sysvar ===
+        verify_bucket_failure_signature(
+            &ctx.accounts.instructions_sysvar,
+            &session.verifier_pubkey,
+            &session_key,
+            bucket_index,
+            bucket_start_slot,
+            failure_reason,
+        )?;
+
+        // === Bitmap deduplication ===
+        require!(
+            !bit_is_set(&session.buckets_failed_bitmap, bucket_index),
+            ErrorCode::BucketAlreadyReported
+        );
+        set_bit(&mut session.buckets_failed_bitmap, bucket_index);
+
+        // === First violation: set termination window ===
+        if session.sla_status == SlaStatus::Pending {
+            session.first_violation_slot = now;
+            session.terminate_deadline_slot = now.saturating_add(session.terminate_window_slots);
+            session.sla_status = SlaStatus::Violated;
+        }
+
+        // === Increment failure counter ===
+        session.buckets_failed = session.buckets_failed
+            .checked_add(1)
+            .ok_or(ErrorCode::Overflow)?;
+
+        // === Accrue penalty ===
+        session.penalty_accrued = session.penalty_accrued
+            .checked_add(session.bucket_penalty)
+            .ok_or(ErrorCode::Overflow)?
+            .min(session.reserve_r);  // Cap at total collateral
+
+        // === Combine failure reason ===
+        session.sla_failure_reason = combine_failure_reason(
+            session.sla_failure_reason,
+            failure_reason,
+        );
+
+        emit!(BucketFailureReported {
+            session: session_key,
+            bucket_index,
+            bucket_start_slot,
+            failure_reason,
+            buckets_failed: session.buckets_failed,
+            penalty_accrued: session.penalty_accrued,
+            is_first_violation: session.buckets_failed == 1,
+        });
+
+        Ok(())
+    }
+
+    /// Terminate session for cause (client exercises termination right)
+    ///
+    /// Requires sla_status == Violated and within termination window.
+    /// Effects:
+    /// - Refunds 100% escrow to user
+    /// - Slashes penalty_accrued from provider collateral
+    /// - Releases remaining collateral to provider
+    /// - Sets sla_status = TerminatedForCause
+    pub fn terminate_for_cause(ctx: Context<TerminateForCause>) -> Result<()> {
+        let clock = Clock::get()?;
+        let now = clock.slot;
+
+        let session_info = ctx.accounts.session.to_account_info();
+        let escrow_info = ctx.accounts.escrow_token_account.to_account_info();
+        let user_token_info = ctx.accounts.user_token_account.to_account_info();
+        let token_program_info = ctx.accounts.token_program.to_account_info();
+        let session_key = ctx.accounts.session.key();
+        let escrow_balance = ctx.accounts.escrow_token_account.amount;
+
+        let session = &mut ctx.accounts.session;
+
+        // === Status guards ===
+        require!(session.is_bid, ErrorCode::NotBidSession);
+        require!(session.state == SessionState::Active, ErrorCode::SessionNotActive);
+        require!(session.sla_status == SlaStatus::Violated, ErrorCode::SessionNotViolated);
+        require!(!session.terminated_for_cause, ErrorCode::SessionAlreadyTerminated);
+
+        // === Termination window check ===
+        require!(
+            now <= session.terminate_deadline_slot,
+            ErrorCode::TerminationWindowExpired
+        );
+
+        // Compute penalty: min(penalty_accrued, bucket_penalty * buckets_failed, reserve_r)
+        let computed_penalty = session.bucket_penalty
+            .checked_mul(session.buckets_failed)
+            .ok_or(ErrorCode::Overflow)?;
+        let actual_penalty = computed_penalty
+            .min(session.penalty_accrued)
+            .min(session.reserve_r);
+
+        let user_key = session.user;
+        let nonce_bytes = session.session_nonce.to_le_bytes();
+        let bump = session.bump;
+        let reserve_r = session.reserve_r;
+        let buckets_failed = session.buckets_failed;
+        let failure_reason = session.sla_failure_reason;
+
+        // Update state
+        session.sla_status = SlaStatus::TerminatedForCause;
+        session.terminated_for_cause = true;
+        session.state = SessionState::Claimed;
+
+        let _ = session;
+
+        let seeds: &[&[u8]] = &[b"sess", user_key.as_ref(), &nonce_bytes, &[bump]];
+        let signer_seeds = &[seeds];
+
+        // === Slash penalty from provider collateral ===
+        if actual_penalty > 0 {
+            let cpi_accounts = SlashAndPay {
+                position: ctx.accounts.position.to_account_info(),
+                vault_token_account: ctx.accounts.vault_token_account.to_account_info(),
+                user_token_account: ctx.accounts.user_token_account.to_account_info(),
+                session_authority: session_info.clone(),
+                token_program: token_program_info.clone(),
+            };
+            let cpi_ctx = CpiContext::new_with_signer(
+                ctx.accounts.collateral_vault_program.to_account_info(),
+                cpi_accounts,
+                signer_seeds,
+            );
+            collateral_vault::cpi::slash_and_pay(cpi_ctx, session_key, actual_penalty)?;
+        }
+
+        // === Release remaining collateral to provider ===
+        let remaining_reserve = reserve_r.saturating_sub(actual_penalty);
+        if remaining_reserve > 0 {
+            let release_accounts = Release {
+                position: ctx.accounts.position.to_account_info(),
+                session_authority: ctx.accounts.session.to_account_info(),
+            };
+            let release_ctx = CpiContext::new_with_signer(
+                ctx.accounts.collateral_vault_program.to_account_info(),
+                release_accounts,
+                signer_seeds,
+            );
+            collateral_vault::cpi::release(release_ctx, session_key, remaining_reserve)?;
+        }
+
+        // === Refund 100% escrow to user ===
+        if escrow_balance > 0 {
+            let cpi_accounts = Transfer {
+                from: escrow_info,
+                to: user_token_info,
+                authority: ctx.accounts.session.to_account_info(),
+            };
+            let cpi_ctx = CpiContext::new_with_signer(token_program_info, cpi_accounts, signer_seeds);
+            token::transfer(cpi_ctx, escrow_balance)?;
+        }
+
+        emit!(SessionTerminatedForCause {
+            session: session_key,
+            penalty_paid: actual_penalty,
+            escrow_refunded: escrow_balance,
+            buckets_failed,
+            failure_reason,
+            remaining_collateral_released: remaining_reserve,
+        });
+
+        Ok(())
+    }
+
+    /// Settle SLA after window ends (alternative to terminate_for_cause)
+    ///
+    /// Callable after sla_window_end_slot.
+    /// Effects:
+    /// - If buckets_failed == 0: sla_status = Met, premium released to host
+    /// - If buckets_failed > 0: sla_status = Failed, penalty slashed, remaining released
+    pub fn settle_sla(ctx: Context<SettleSla>) -> Result<()> {
+        let clock = Clock::get()?;
+        let now = clock.slot;
+
+        let session_info = ctx.accounts.session.to_account_info();
+        let escrow_info = ctx.accounts.escrow_token_account.to_account_info();
+        let provider_token_info = ctx.accounts.provider_token_account.to_account_info();
+        let user_token_info = ctx.accounts.user_token_account.to_account_info();
+        let token_program_info = ctx.accounts.token_program.to_account_info();
+        let session_key = ctx.accounts.session.key();
+        let escrow_balance = ctx.accounts.escrow_token_account.amount;
+
+        let session = &mut ctx.accounts.session;
+
+        // === Status guards ===
+        require!(session.is_bid, ErrorCode::NotBidSession);
+        require!(session.state == SessionState::Active, ErrorCode::SessionNotActive);
+        require!(
+            session.sla_status == SlaStatus::Pending || session.sla_status == SlaStatus::Violated,
+            ErrorCode::SlaAlreadyEvaluated
+        );
+        require!(!session.terminated_for_cause, ErrorCode::SessionAlreadyTerminated);
+
+        // === Window must be ended ===
+        require!(now > session.sla_window_end_slot, ErrorCode::SlaWindowNotEnded);
+
+        let user_key = session.user;
+        let nonce_bytes = session.session_nonce.to_le_bytes();
+        let bump = session.bump;
+        let reserve_r = session.reserve_r;
+        let buckets_failed = session.buckets_failed;
+
+        let seeds: &[&[u8]] = &[b"sess", user_key.as_ref(), &nonce_bytes, &[bump]];
+        let signer_seeds = &[seeds];
+
+        if buckets_failed == 0 {
+            // === SLA MET: Premium to host, release all collateral ===
+            session.sla_status = SlaStatus::Met;
+            session.state = SessionState::Closed;
+
+            // Release all collateral
+            let release_accounts = Release {
+                position: ctx.accounts.position.to_account_info(),
+                session_authority: session_info.clone(),
+            };
+            let release_ctx = CpiContext::new_with_signer(
+                ctx.accounts.collateral_vault_program.to_account_info(),
+                release_accounts,
+                signer_seeds,
+            );
+            collateral_vault::cpi::release(release_ctx, session_key, reserve_r)?;
+
+            // Transfer premium (escrow) to provider
+            if escrow_balance > 0 {
+                let cpi_accounts = Transfer {
+                    from: escrow_info,
+                    to: provider_token_info,
+                    authority: session_info,
+                };
+                let cpi_ctx = CpiContext::new_with_signer(token_program_info, cpi_accounts, signer_seeds);
+                token::transfer(cpi_ctx, escrow_balance)?;
+            }
+
+            emit!(SlaSettled {
+                session: session_key,
+                status: SlaStatus::Met,
+                buckets_failed: 0,
+                penalty_paid: 0,
+                premium_to_host: escrow_balance,
+                premium_refunded_to_user: 0,
+            });
+        } else {
+            // === SLA FAILED: Penalty slashed, premium split or refunded ===
+            session.sla_status = SlaStatus::Failed;
+            session.state = SessionState::Claimed;
+
+            // Compute penalty
+            let computed_penalty = session.bucket_penalty
+                .checked_mul(buckets_failed)
+                .ok_or(ErrorCode::Overflow)?;
+            let actual_penalty = computed_penalty
+                .min(session.penalty_accrued)
+                .min(reserve_r);
+
+            let _failure_reason = session.sla_failure_reason;
+            let _ = session;
+
+            // Slash penalty
+            if actual_penalty > 0 {
+                let cpi_accounts = SlashAndPay {
+                    position: ctx.accounts.position.to_account_info(),
+                    vault_token_account: ctx.accounts.vault_token_account.to_account_info(),
+                    user_token_account: ctx.accounts.user_token_account.to_account_info(),
+                    session_authority: session_info.clone(),
+                    token_program: token_program_info.clone(),
+                };
+                let cpi_ctx = CpiContext::new_with_signer(
+                    ctx.accounts.collateral_vault_program.to_account_info(),
+                    cpi_accounts,
+                    signer_seeds,
+                );
+                collateral_vault::cpi::slash_and_pay(cpi_ctx, session_key, actual_penalty)?;
+            }
+
+            // Release remaining collateral
+            let remaining_reserve = reserve_r.saturating_sub(actual_penalty);
+            if remaining_reserve > 0 {
+                let release_accounts = Release {
+                    position: ctx.accounts.position.to_account_info(),
+                    session_authority: ctx.accounts.session.to_account_info(),
+                };
+                let release_ctx = CpiContext::new_with_signer(
+                    ctx.accounts.collateral_vault_program.to_account_info(),
+                    release_accounts,
+                    signer_seeds,
+                );
+                collateral_vault::cpi::release(release_ctx, session_key, remaining_reserve)?;
+            }
+
+            // Refund escrow to user (SLA failed = no premium for host)
+            if escrow_balance > 0 {
+                let cpi_accounts = Transfer {
+                    from: escrow_info,
+                    to: user_token_info,
+                    authority: ctx.accounts.session.to_account_info(),
+                };
+                let cpi_ctx = CpiContext::new_with_signer(token_program_info, cpi_accounts, signer_seeds);
+                token::transfer(cpi_ctx, escrow_balance)?;
+            }
+
+            emit!(SlaSettled {
+                session: session_key,
+                status: SlaStatus::Failed,
+                buckets_failed,
+                penalty_paid: actual_penalty,
+                premium_to_host: 0,
+                premium_refunded_to_user: escrow_balance,
+            });
+        }
+
+        Ok(())
+    }
 }
 
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+// Bitmap helpers for bucket tracking (1024 buckets max)
+fn bit_is_set(bitmap: &[u8; 128], idx: u64) -> bool {
+    if idx >= 1024 {
+        return true; // Out of bounds treated as "already set" (reject)
+    }
+    let i = idx as usize;
+    let byte = i >> 3;
+    let bit = i & 7;
+    (bitmap[byte] & (1u8 << bit)) != 0
+}
+
+fn set_bit(bitmap: &mut [u8; 128], idx: u64) {
+    if idx >= 1024 {
+        return; // Out of bounds no-op
+    }
+    let i = idx as usize;
+    let byte = i >> 3;
+    let bit = i & 7;
+    bitmap[byte] |= 1u8 << bit;
+}
+
+/// Compute bucket start slot with checked math
+fn checked_bucket_start(
+    sla_window_start: u64,
+    bucket_index: u64,
+    bucket_slots: u64,
+) -> Option<u64> {
+    let offset = bucket_index.checked_mul(bucket_slots)?;
+    sla_window_start.checked_add(offset)
+}
+
+/// Compute bucket end slot with checked math
+#[allow(dead_code)]
+fn checked_bucket_end(
+    sla_window_start: u64,
+    bucket_index: u64,
+    bucket_slots: u64,
+) -> Option<u64> {
+    let start = checked_bucket_start(sla_window_start, bucket_index, bucket_slots)?;
+    start.checked_add(bucket_slots)?.checked_sub(1)
+}
+
+/// Compute buckets_total with validation
+fn compute_buckets_total(sla_window_slots: u64, bucket_slots: u64) -> Result<u64> {
+    require!(bucket_slots > 0, ErrorCode::InvalidBucketConfig);
+    require!(sla_window_slots % bucket_slots == 0, ErrorCode::InvalidBucketConfig);
+    let total = sla_window_slots
+        .checked_div(bucket_slots)
+        .ok_or(ErrorCode::Overflow)?;
+    require!(total > 0 && total <= 1024, ErrorCode::InvalidBucketConfig);
+    Ok(total)
+}
+
+/// Compute per-bucket penalty with checked math
+fn compute_bucket_penalty(
+    collateral: u64,
+    max_penalty_bps: u16,
+    buckets_total: u64,
+) -> Result<u64> {
+    // penalty_per_bucket = collateral * max_penalty_bps / (buckets_total * 10_000)
+    let numerator = (collateral as u128)
+        .checked_mul(max_penalty_bps as u128)
+        .ok_or(ErrorCode::Overflow)?;
+    let denominator = (buckets_total as u128)
+        .checked_mul(10_000)
+        .ok_or(ErrorCode::Overflow)?;
+    let result = numerator
+        .checked_div(denominator)
+        .ok_or(ErrorCode::Overflow)?;
+    u64::try_from(result).map_err(|_| ErrorCode::Overflow.into())
+}
+
+/// Combine failure reasons
+fn combine_failure_reason(current: SlaFailureReason, new: SlaFailureReason) -> SlaFailureReason {
+    match (current, new) {
+        (SlaFailureReason::None, x) => x,
+        (x, SlaFailureReason::None) => x,
+        (SlaFailureReason::Latency, SlaFailureReason::Bandwidth) => SlaFailureReason::Both,
+        (SlaFailureReason::Bandwidth, SlaFailureReason::Latency) => SlaFailureReason::Both,
+        (SlaFailureReason::Both, _) => SlaFailureReason::Both,
+        (_, SlaFailureReason::Both) => SlaFailureReason::Both,
+        (x, _) => x, // Keep existing if same type
+    }
+}
+
+/// Verify Ed25519 signature via Instructions sysvar introspection
+/// 
+/// The Ed25519 precompile instruction must be in the same transaction,
+/// immediately preceding this instruction. We verify:
+/// 1. The instruction targets the Ed25519 program
+/// 2. The pubkey matches expected verifier
+/// 3. The message matches our expected payload
+fn verify_bucket_failure_signature(
+    instructions_sysvar: &AccountInfo,
+    expected_verifier: &Pubkey,
+    session_key: &Pubkey,
+    bucket_index: u64,
+    bucket_start_slot: u64,
+    failure_reason: SlaFailureReason,
+) -> Result<()> {
+    // Get current instruction index
+    let current_ix_idx = instructions::load_current_index_checked(instructions_sysvar)
+        .map_err(|_| ErrorCode::InvalidEd25519Instruction)?;
+    
+    // Ed25519 instruction must be immediately before this one
+    require!(current_ix_idx > 0, ErrorCode::InvalidEd25519Instruction);
+    
+    let ed25519_ix = load_instruction_at_checked(
+        (current_ix_idx - 1) as usize,
+        instructions_sysvar,
+    ).map_err(|_| ErrorCode::InvalidEd25519Instruction)?;
+    
+    // Verify it's the Ed25519 program
+    require!(
+        ed25519_ix.program_id == ED25519_PROGRAM_ID,
+        ErrorCode::InvalidEd25519Instruction
+    );
+    
+    // Ed25519 instruction data format:
+    // - 2 bytes: number of signatures
+    // - For each signature:
+    //   - 2 bytes: signature offset
+    //   - 2 bytes: signature instruction index (0xFF = same tx)
+    //   - 2 bytes: public key offset  
+    //   - 2 bytes: public key instruction index
+    //   - 2 bytes: message data offset
+    //   - 2 bytes: message data size
+    //   - 2 bytes: message instruction index
+    // Then the actual data (signatures, pubkeys, messages)
+    
+    require!(ed25519_ix.data.len() >= 16, ErrorCode::InvalidEd25519Instruction);
+    
+    // Build expected message: (program_id, session, bucket_index, bucket_start, failure_reason)
+    let mut expected_message = Vec::with_capacity(32 + 32 + 8 + 8 + 1);
+    expected_message.extend_from_slice(&crate::ID.to_bytes());  // Domain separator
+    expected_message.extend_from_slice(&session_key.to_bytes());
+    expected_message.extend_from_slice(&bucket_index.to_le_bytes());
+    expected_message.extend_from_slice(&bucket_start_slot.to_le_bytes());
+    expected_message.push(failure_reason as u8);
+    
+    // Parse Ed25519 instruction to verify pubkey and message
+    // Simplified check: verify the instruction contains our expected verifier pubkey
+    // and the message bytes match
+    let verifier_bytes = expected_verifier.to_bytes();
+    
+    // Check pubkey is present in instruction data
+    let pubkey_found = ed25519_ix.data
+        .windows(32)
+        .any(|w| w == verifier_bytes);
+    require!(pubkey_found, ErrorCode::InvalidAttester);
+    
+    // Check message is present in instruction data
+    let message_found = ed25519_ix.data
+        .windows(expected_message.len())
+        .any(|w| w == expected_message.as_slice());
+    require!(message_found, ErrorCode::SignatureMessageMismatch);
+    
+    Ok(())
+}
 
 fn compute_insurance_coverage(max_spend: u64, price_per_chunk: u64) -> u64 {
     use session_escrow::{INSURANCE_A, INSURANCE_B, INSURANCE_MIN_BPS, INSURANCE_CAP_BPS};
@@ -1154,6 +1735,97 @@ pub struct ClaimStall<'info> {
 }
 
 // ============================================================================
+// Bucketed SLA Account Structs
+// ============================================================================
+
+#[derive(Accounts)]
+pub struct ReportBucketFailure<'info> {
+    #[account(
+        mut,
+        seeds = [b"sess", session.user.as_ref(), &session.session_nonce.to_le_bytes()],
+        bump = session.bump
+    )]
+    pub session: Account<'info, Session>,
+
+    /// Authorized verifier (must match session.verifier_pubkey)
+    pub verifier: Signer<'info>,
+
+    /// CHECK: Instructions sysvar for Ed25519 signature introspection
+    #[account(address = instructions::ID)]
+    pub instructions_sysvar: AccountInfo<'info>,
+}
+
+#[derive(Accounts)]
+pub struct TerminateForCause<'info> {
+    #[account(
+        mut,
+        seeds = [b"sess", session.user.as_ref(), &session.session_nonce.to_le_bytes()],
+        bump = session.bump,
+        has_one = user @ ErrorCode::WrongUser
+    )]
+    pub session: Account<'info, Session>,
+
+    /// Provider's collateral position (for slash CPI)
+    #[account(mut)]
+    pub position: Account<'info, ProviderPosition>,
+
+    /// Provider's collateral vault token account
+    #[account(mut)]
+    pub vault_token_account: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        associated_token::mint = session.mint,
+        associated_token::authority = session
+    )]
+    pub escrow_token_account: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub user_token_account: Account<'info, TokenAccount>,
+
+    pub user: Signer<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub collateral_vault_program: Program<'info, CollateralVault>,
+}
+
+#[derive(Accounts)]
+pub struct SettleSla<'info> {
+    #[account(
+        mut,
+        seeds = [b"sess", session.user.as_ref(), &session.session_nonce.to_le_bytes()],
+        bump = session.bump
+    )]
+    pub session: Account<'info, Session>,
+
+    /// Provider's collateral position (for slash/release CPI)
+    #[account(mut)]
+    pub position: Account<'info, ProviderPosition>,
+
+    /// Provider's collateral vault token account
+    #[account(mut)]
+    pub vault_token_account: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        associated_token::mint = session.mint,
+        associated_token::authority = session
+    )]
+    pub escrow_token_account: Account<'info, TokenAccount>,
+
+    /// Provider token account (for premium payment if SLA met)
+    #[account(mut)]
+    pub provider_token_account: Account<'info, TokenAccount>,
+
+    /// User token account (for escrow refund if SLA failed)
+    #[account(mut)]
+    pub user_token_account: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+    pub collateral_vault_program: Program<'info, CollateralVault>,
+}
+
+// ============================================================================
 // State
 // ============================================================================
 
@@ -1201,9 +1873,32 @@ pub struct Session {
     pub sla_failure_reason: SlaFailureReason,
     pub latency_attested: bool,
 
-    // Nonce tracking for bandwidth SLA
+    // Nonce tracking for bandwidth SLA (legacy window-level)
     pub nonce_at_window_start: u64,
     pub nonce_at_window_end: u64,
+
+    // Bucketed SLA configuration
+    pub bucket_slots: u64,                  // Slots per bucket (e.g. 750 ≈ 5 min at 400ms)
+    pub buckets_total: u64,                 // sla_window_slots / bucket_slots (max 1024)
+    pub bucket_penalty: u64,                // Precomputed penalty per bucket
+
+    // Bucketed downtime tracking
+    pub buckets_failed: u64,                // Counter for fast penalty calc
+    pub buckets_failed_bitmap: [u8; 128],   // 1024 bits = 1024 buckets max
+
+    // Termination window
+    pub first_violation_slot: u64,          // 0 until first fail
+    pub terminate_window_slots: u64,        // e.g. 302400 ≈ 7 days
+    pub terminate_deadline_slot: u64,       // first_violation + window
+
+    // Penalty accounting
+    pub penalty_accrued: u64,               // Running total (tokens)
+
+    // Attester configuration
+    pub verifier_pubkey: Pubkey,            // Authorized attester for bucket reports
+
+    // Convenience flags
+    pub terminated_for_cause: bool,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, InitSpace)]
@@ -1217,10 +1912,12 @@ pub enum SessionState {
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, InitSpace)]
 pub enum SlaStatus {
-    None,     // Not a bid session or SLA not yet active
-    Pending,  // SLA evaluation pending
-    Met,      // SLA requirements met
-    Failed,   // SLA requirements violated
+    None,               // Not a bid session or SLA not yet active
+    Pending,            // SLA active, no violations yet
+    Violated,           // First miss occurred, termination window open
+    Met,                // Window ended, SLA passed
+    Failed,             // Window ended, violations settled (no termination)
+    TerminatedForCause, // Client exercised termination right
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, InitSpace)]
@@ -1229,6 +1926,7 @@ pub enum SlaFailureReason {
     Latency,
     Bandwidth,
     Both,
+    PrivacyMode,  // Future: privacy/confidentiality violations
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
@@ -1328,6 +2026,38 @@ pub struct SlaFailureClaimed {
     pub failure_reason: SlaFailureReason,
 }
 
+// Bucketed SLA Events
+#[event]
+pub struct BucketFailureReported {
+    pub session: Pubkey,
+    pub bucket_index: u64,
+    pub bucket_start_slot: u64,
+    pub failure_reason: SlaFailureReason,
+    pub buckets_failed: u64,
+    pub penalty_accrued: u64,
+    pub is_first_violation: bool,
+}
+
+#[event]
+pub struct SessionTerminatedForCause {
+    pub session: Pubkey,
+    pub penalty_paid: u64,
+    pub escrow_refunded: u64,
+    pub buckets_failed: u64,
+    pub failure_reason: SlaFailureReason,
+    pub remaining_collateral_released: u64,
+}
+
+#[event]
+pub struct SlaSettled {
+    pub session: Pubkey,
+    pub status: SlaStatus,
+    pub buckets_failed: u64,
+    pub penalty_paid: u64,
+    pub premium_to_host: u64,
+    pub premium_refunded_to_user: u64,
+}
+
 #[event]
 pub struct SessionClosing {
     pub session: Pubkey,
@@ -1414,4 +2144,31 @@ pub enum ErrorCode {
     VerifierNotAuthorized,
     #[msg("Latency already attested")]
     LatencyAlreadyAttested,
+    // Bucketed SLA errors
+    #[msg("Invalid bucket configuration")]
+    InvalidBucketConfig,
+    #[msg("Bucket already reported")]
+    BucketAlreadyReported,
+    #[msg("Bucket index out of bounds")]
+    BucketIndexOutOfBounds,
+    #[msg("Bucket slot mismatch")]
+    BucketSlotMismatch,
+    #[msg("Termination window expired")]
+    TerminationWindowExpired,
+    #[msg("Termination window not started")]
+    TerminationWindowNotStarted,
+    #[msg("Session not in violated state")]
+    SessionNotViolated,
+    #[msg("Session already terminated")]
+    SessionAlreadyTerminated,
+    #[msg("Invalid attester")]
+    InvalidAttester,
+    #[msg("Invalid Ed25519 signature instruction")]
+    InvalidEd25519Instruction,
+    #[msg("Signature message mismatch")]
+    SignatureMessageMismatch,
+    #[msg("Report outside SLA window")]
+    ReportOutsideSlaWindow,
+    #[msg("Report after termination deadline")]
+    ReportAfterDeadline,
 }
