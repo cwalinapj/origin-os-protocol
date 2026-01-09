@@ -216,7 +216,7 @@ All coordination is non-custodial; funds only move per contract rules.
 ## Toolchain Requirements
 | Component | Version |
 |----------|---------|
-| Rust | 1.79.0 (pinned in rust-toolchain.toml) |
+| Rust | 1.85.0 (pinned in rust-toolchain.toml) |
 | Anchor | 0.30.1 |
 | Solana CLI | 1.18.26 |
 

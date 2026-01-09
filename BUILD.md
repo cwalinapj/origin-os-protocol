@@ -4,7 +4,7 @@
 
 | Component | Version | Notes |
 |-----------|---------|-------|
-| **Rust** | 1.79.0 | Pinned in `rust-toolchain.toml` |
+| **Rust** | 1.85.0 | Pinned in `rust-toolchain.toml` |
 | **Anchor** | 0.30.1 | CLI and framework |
 | **Solana CLI** | 1.18.26 | Must match program dependencies |
 | **Node.js** | 18+ | For TypeScript tests |
@@ -104,7 +104,7 @@ anchor deploy --provider.cluster mainnet
 Check that your toolchain matches the pinned versions:
 
 ```bash
-rustc --version        # rustc 1.79.0
+rustc --version        # rustc 1.85.0
 solana --version       # solana-cli 1.18.26
 anchor --version       # anchor-cli 0.30.1
 ```
@@ -120,7 +120,7 @@ cd /path/to/origin-os-protocol
 rustup show
 ```
 
-The output should show `1.79.0` as the active toolchain.
+The output should show `1.85.0` as the active toolchain.
 
 ### Solana version mismatch
 
