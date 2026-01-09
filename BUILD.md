@@ -138,3 +138,11 @@ If builds fail unexpectedly, clean and rebuild:
 anchor clean
 anchor build
 ```
+
+## Continuous Integration
+
+The project uses GitHub Actions for CI. The workflow runs both:
+- `cargo test` - Rust unit tests (currently only in `pyth_helpers`)
+- `anchor test` - Full integration test suite with TypeScript tests
+
+See `docs/CI.md` for detailed information about the CI setup and rationale.
