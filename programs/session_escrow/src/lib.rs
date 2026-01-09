@@ -31,13 +31,12 @@ pub mod session_escrow {
     // Bid mode constants
     pub const BID_PREMIUM_WEIGHT: u64 = 50; // 50% weight on premium for bid coverage
     pub const BID_SLA_WEIGHT: u64 = 50;     // 50% weight on SLA strictness
-    pub const SLA_FAIL_PAYOUT_BPS: u64 = 5000; // 50% of insured amount on SLA failure
 
     /// Open a new session between user and provider
     ///
     /// When is_bid is true:
     /// - Computes additional bid_coverage_p from premium and SLA targets
-    /// - Sets SLA window timing (sla_window_start = current_slot + warmup_slots)
+    /// - Sets SLA window timing (sla_window_start_slot = current_slot + warmup_slots)
     /// - Reserves total collateral (reserve_base + reserve_bid)
     pub fn open_session(
         ctx: Context<OpenSession>,
@@ -51,8 +50,9 @@ pub mod session_escrow {
         // Bid mode parameters
         is_bid: bool,
         premium_bps: u16,
-        latency_target_ms: u32,
-        bandwidth_target_chunks: u64,
+        fail_payout_bps: u16,
+        latency_target_ms: u16,
+        bandwidth_min_chunks: u32,
         sla_warmup_slots: u64,
         sla_window_slots: u64,
     ) -> Result<()> {
@@ -68,12 +68,12 @@ pub mod session_escrow {
             .ok_or(ErrorCode::Overflow)?;
 
         // Compute bid coverage if in bid mode
-        let (bid_coverage_p, reserve_bid, sla_window_start, sla_window_end) = if is_bid {
+        let (bid_coverage_p, reserve_bid, sla_window_start_slot, sla_window_end_slot) = if is_bid {
             let bid_cov = compute_bid_coverage(
                 max_spend,
                 premium_bps,
                 latency_target_ms,
-                bandwidth_target_chunks,
+                bandwidth_min_chunks,
             );
             let res_bid = bid_cov
                 .checked_mul(cr_bps)
@@ -117,7 +117,6 @@ pub mod session_escrow {
         session.price_per_chunk = price_per_chunk;
         session.max_spend = max_spend;
         session.total_spent = 0;
-        session.coverage_p = base_coverage_p;
         session.reserve_r = total_reserve;
         session.start_deadline_slot = start_deadline_slot;
         session.stall_timeout_slots = stall_timeout_slots;
@@ -127,19 +126,31 @@ pub mod session_escrow {
         session.next_permit_nonce = 0;
         session.bump = session_bump;
 
-        // Bid mode fields
+        // Bid/SLA fields
         session.is_bid = is_bid;
         session.premium_bps = premium_bps;
+        session.fail_payout_bps = fail_payout_bps;
+        session.latency_target_ms = latency_target_ms;
+        session.bandwidth_min_chunks = bandwidth_min_chunks;
+        session.sla_warmup_slots = sla_warmup_slots;
+        session.sla_window_slots = sla_window_slots;
+        session.sla_window_start_slot = sla_window_start_slot;
+        session.sla_window_end_slot = sla_window_end_slot;
+
+        // Insurance split
+        session.base_coverage_p = base_coverage_p;
         session.bid_coverage_p = bid_coverage_p;
         session.reserve_base = reserve_base;
         session.reserve_bid = reserve_bid;
-        session.sla_window_start = sla_window_start;
-        session.sla_window_end = sla_window_end;
-        session.latency_target_ms = latency_target_ms;
-        session.bandwidth_target_chunks = bandwidth_target_chunks;
+
+        // SLA state
+        session.sla_status = SlaStatus::None;
+        session.sla_failure_reason = SlaFailureReason::None;
+        session.latency_attested = false;
+
+        // Nonce tracking for bandwidth SLA
         session.nonce_at_window_start = 0;
         session.nonce_at_window_end = 0;
-        session.sla_status = SlaStatus::None;
 
         emit!(SessionOpened {
             session: session_key,
@@ -147,11 +158,12 @@ pub mod session_escrow {
             provider: provider_key,
             mode_id,
             max_spend,
-            coverage_p: base_coverage_p,
+            base_coverage_p,
             reserve_r: total_reserve,
             start_deadline_slot,
             is_bid,
             premium_bps,
+            fail_payout_bps,
             bid_coverage_p,
             reserve_base,
             reserve_bid,
@@ -207,8 +219,7 @@ pub mod session_escrow {
         session.state = SessionState::Active;
         session.last_progress_slot = clock.slot;
 
-        // For bid sessions, snapshot the nonce at window start
-        // (will be current nonce when SLA window begins)
+        // For bid sessions, set SLA status to Pending
         if session.is_bid {
             session.sla_status = SlaStatus::Pending;
         }
@@ -239,7 +250,7 @@ pub mod session_escrow {
 
         require!(session.is_bid, ErrorCode::NotBidSession);
         require!(session.state == SessionState::Active, ErrorCode::SessionNotActive);
-        require!(clock.slot >= session.sla_window_start, ErrorCode::SlaWindowNotStarted);
+        require!(clock.slot >= session.sla_window_start_slot, ErrorCode::SlaWindowNotStarted);
         require!(session.nonce_at_window_start == 0, ErrorCode::WindowAlreadySnapshotted);
 
         session.nonce_at_window_start = session.next_permit_nonce;
@@ -288,14 +299,9 @@ pub mod session_escrow {
             expiry_slot,
         )?;
 
-        // For bid sessions, validate the amount includes premium
-        // The permit amount must reflect the premium-adjusted price
-        if session.is_bid && session.premium_bps > 0 {
-            // The client should have computed the amount with premium already
-            // We just validate it doesn't exceed escrow and max_spend
-            // effective_price = base_price * (1 + premium_bps/10_000)
-            // This is enforced client-side when creating permits
-        }
+        // For bid sessions, the amount should already include the premium
+        // effective_price = base_price * (1 + premium_bps/10_000)
+        // This is enforced client-side when creating permits
 
         require!(amount <= escrow_balance, ErrorCode::InsufficientEscrow);
 
@@ -338,7 +344,7 @@ pub mod session_escrow {
     ///
     /// Callable by anyone after the SLA window has ended.
     /// Compares nonce progression within the window against target.
-    /// If chunks delivered < bandwidth_target_chunks, marks SLA as Failed.
+    /// If chunks delivered < bandwidth_min_chunks, marks SLA as Failed.
     pub fn evaluate_bandwidth_sla(ctx: Context<EvaluateBandwidthSla>) -> Result<()> {
         let clock = Clock::get()?;
         let session_key = ctx.accounts.session.key();
@@ -346,8 +352,11 @@ pub mod session_escrow {
 
         require!(session.is_bid, ErrorCode::NotBidSession);
         require!(session.state == SessionState::Active, ErrorCode::SessionNotActive);
-        require!(session.sla_status == SlaStatus::Pending, ErrorCode::SlaAlreadyEvaluated);
-        require!(clock.slot > session.sla_window_end, ErrorCode::SlaWindowNotEnded);
+        require!(
+            session.sla_status == SlaStatus::Pending || session.sla_status == SlaStatus::None,
+            ErrorCode::SlaAlreadyEvaluated
+        );
+        require!(clock.slot > session.sla_window_end_slot, ErrorCode::SlaWindowNotEnded);
         require!(session.nonce_at_window_start > 0, ErrorCode::WindowStartNotSnapshotted);
 
         // Snapshot the end nonce
@@ -358,27 +367,29 @@ pub mod session_escrow {
             .saturating_sub(session.nonce_at_window_start);
 
         // Check if bandwidth target was met
-        if chunks_delivered < session.bandwidth_target_chunks {
-            session.sla_status = SlaStatus::Failed;
+        let bandwidth_passed = chunks_delivered >= session.bandwidth_min_chunks as u64;
 
-            emit!(SlaEvaluated {
-                session: session_key,
-                sla_type: SlaType::Bandwidth,
-                passed: false,
-                actual_value: chunks_delivered,
-                target_value: session.bandwidth_target_chunks,
-            });
-        } else {
-            // Bandwidth passed, but latency might still fail
-            // Keep as Pending until latency is evaluated or session closes
-            emit!(SlaEvaluated {
-                session: session_key,
-                sla_type: SlaType::Bandwidth,
-                passed: true,
-                actual_value: chunks_delivered,
-                target_value: session.bandwidth_target_chunks,
-            });
+        if !bandwidth_passed {
+            // Update failure reason
+            match session.sla_failure_reason {
+                SlaFailureReason::None => {
+                    session.sla_failure_reason = SlaFailureReason::Bandwidth;
+                }
+                SlaFailureReason::Latency => {
+                    session.sla_failure_reason = SlaFailureReason::Both;
+                }
+                _ => {}
+            }
+            session.sla_status = SlaStatus::Failed;
         }
+
+        emit!(SlaEvaluated {
+            session: session_key,
+            sla_type: SlaType::Bandwidth,
+            passed: bandwidth_passed,
+            actual_value: chunks_delivered,
+            target_value: session.bandwidth_min_chunks as u64,
+        });
 
         Ok(())
     }
@@ -389,7 +400,7 @@ pub mod session_escrow {
     /// If rtt_p90_ms > latency_target_ms, marks SLA as Failed.
     pub fn submit_latency_attestation(
         ctx: Context<SubmitLatencyAttestation>,
-        rtt_p90_ms: u32,
+        rtt_p90_ms: u16,
         measurement_window_start: u64,
         measurement_window_end: u64,
     ) -> Result<()> {
@@ -398,38 +409,41 @@ pub mod session_escrow {
 
         require!(session.is_bid, ErrorCode::NotBidSession);
         require!(session.state == SessionState::Active, ErrorCode::SessionNotActive);
-        require!(
-            session.sla_status == SlaStatus::Pending,
-            ErrorCode::SlaAlreadyEvaluated
-        );
+        require!(!session.latency_attested, ErrorCode::LatencyAlreadyAttested);
 
         // Validate measurement window overlaps with SLA window
         require!(
-            measurement_window_start <= session.sla_window_end &&
-            measurement_window_end >= session.sla_window_start,
+            measurement_window_start <= session.sla_window_end_slot &&
+            measurement_window_end >= session.sla_window_start_slot,
             ErrorCode::InvalidMeasurementWindow
         );
 
-        // Check if latency target was violated
-        if rtt_p90_ms > session.latency_target_ms {
-            session.sla_status = SlaStatus::Failed;
+        session.latency_attested = true;
 
-            emit!(SlaEvaluated {
-                session: session_key,
-                sla_type: SlaType::Latency,
-                passed: false,
-                actual_value: rtt_p90_ms as u64,
-                target_value: session.latency_target_ms as u64,
-            });
-        } else {
-            emit!(SlaEvaluated {
-                session: session_key,
-                sla_type: SlaType::Latency,
-                passed: true,
-                actual_value: rtt_p90_ms as u64,
-                target_value: session.latency_target_ms as u64,
-            });
+        // Check if latency target was violated
+        let latency_passed = rtt_p90_ms <= session.latency_target_ms;
+
+        if !latency_passed {
+            // Update failure reason
+            match session.sla_failure_reason {
+                SlaFailureReason::None => {
+                    session.sla_failure_reason = SlaFailureReason::Latency;
+                }
+                SlaFailureReason::Bandwidth => {
+                    session.sla_failure_reason = SlaFailureReason::Both;
+                }
+                _ => {}
+            }
+            session.sla_status = SlaStatus::Failed;
         }
+
+        emit!(SlaEvaluated {
+            session: session_key,
+            sla_type: SlaType::Latency,
+            passed: latency_passed,
+            actual_value: rtt_p90_ms as u64,
+            target_value: session.latency_target_ms as u64,
+        });
 
         emit!(LatencyAttestationSubmitted {
             session: session_key,
@@ -442,10 +456,31 @@ pub mod session_escrow {
         Ok(())
     }
 
+    /// Mark SLA as Met (callable after window ends if no failures)
+    pub fn finalize_sla_met(ctx: Context<FinalizeSla>) -> Result<()> {
+        let clock = Clock::get()?;
+        let session = &mut ctx.accounts.session;
+
+        require!(session.is_bid, ErrorCode::NotBidSession);
+        require!(session.state == SessionState::Active, ErrorCode::SessionNotActive);
+        require!(session.sla_status == SlaStatus::Pending, ErrorCode::SlaAlreadyEvaluated);
+        require!(clock.slot > session.sla_window_end_slot, ErrorCode::SlaWindowNotEnded);
+        require!(session.sla_failure_reason == SlaFailureReason::None, ErrorCode::SlaHasFailures);
+
+        session.sla_status = SlaStatus::Met;
+
+        emit!(SlaFinalized {
+            session: ctx.accounts.session.key(),
+            status: SlaStatus::Met,
+        });
+
+        Ok(())
+    }
+
     /// Claim SLA failure payout
     ///
     /// Requires sla_status == Failed.
-    /// Computes payout = insured_amount * SLA_FAIL_PAYOUT_BPS / 10_000
+    /// Computes payout = (base_coverage_p + bid_coverage_p) * fail_payout_bps / 10_000
     /// Pays from reserve_bid first, then reserve_base if needed.
     pub fn claim_sla_failure(ctx: Context<ClaimSlaFailure>) -> Result<()> {
         let session_info = ctx.accounts.session.to_account_info();
@@ -465,13 +500,13 @@ pub mod session_escrow {
         );
 
         // Calculate total insured amount (base + bid coverage)
-        let total_insured = session.coverage_p
+        let total_insured = session.base_coverage_p
             .checked_add(session.bid_coverage_p)
             .ok_or(ErrorCode::Overflow)?;
 
-        // Calculate payout (50% of insured amount by default)
+        // Calculate payout using session's fail_payout_bps
         let payout = total_insured
-            .checked_mul(SLA_FAIL_PAYOUT_BPS)
+            .checked_mul(session.fail_payout_bps as u64)
             .ok_or(ErrorCode::Overflow)?
             .checked_div(10000)
             .ok_or(ErrorCode::Overflow)?;
@@ -539,6 +574,7 @@ pub mod session_escrow {
             payout: actual_payout,
             escrow_refunded: escrow_balance,
             remaining_reserve_released: remaining_reserve,
+            failure_reason: ctx.accounts.session.sla_failure_reason,
         });
 
         Ok(())
@@ -580,9 +616,9 @@ pub mod session_escrow {
         let reserve_r = session.reserve_r;
         let was_active = session.acked;
 
-        // For bid sessions that were never evaluated, mark SLA as passed
+        // For bid sessions that were never evaluated as failed, mark SLA as Met
         if session.is_bid && session.sla_status == SlaStatus::Pending {
-            session.sla_status = SlaStatus::Passed;
+            session.sla_status = SlaStatus::Met;
         }
 
         session.state = SessionState::Closed;
@@ -696,7 +732,7 @@ pub mod session_escrow {
             .ok_or(ErrorCode::Overflow)?;
         require!(clock.slot > stall_deadline, ErrorCode::StallTimeoutNotReached);
 
-        let payout = session.coverage_p.min(session.reserve_r);
+        let payout = session.base_coverage_p.min(session.reserve_r);
         let user_key = session.user;
         let nonce_bytes = session.session_nonce.to_le_bytes();
         let bump = session.bump;
@@ -771,8 +807,8 @@ fn compute_insurance_coverage(max_spend: u64, price_per_chunk: u64) -> u64 {
 fn compute_bid_coverage(
     max_spend: u64,
     premium_bps: u16,
-    latency_target_ms: u32,
-    bandwidth_target_chunks: u64,
+    latency_target_ms: u16,
+    bandwidth_min_chunks: u32,
 ) -> u64 {
     use session_escrow::{BID_PREMIUM_WEIGHT, BID_SLA_WEIGHT};
 
@@ -791,7 +827,7 @@ fn compute_bid_coverage(
         100
     };
 
-    let bandwidth_strictness = bandwidth_target_chunks.min(1000); // Cap at 1000 for normalization
+    let bandwidth_strictness = (bandwidth_min_chunks as u64).min(1000); // Cap at 1000 for normalization
 
     let sla_factor = latency_strictness
         .saturating_add(bandwidth_strictness)
@@ -975,6 +1011,16 @@ pub struct SubmitLatencyAttestation<'info> {
 }
 
 #[derive(Accounts)]
+pub struct FinalizeSla<'info> {
+    #[account(
+        mut,
+        seeds = [b"sess", session.user.as_ref(), &session.session_nonce.to_le_bytes()],
+        bump = session.bump
+    )]
+    pub session: Account<'info, Session>,
+}
+
+#[derive(Accounts)]
 pub struct ClaimSlaFailure<'info> {
     #[account(
         mut,
@@ -1124,7 +1170,6 @@ pub struct Session {
     pub price_per_chunk: u64,
     pub max_spend: u64,
     pub total_spent: u64,
-    pub coverage_p: u64,
     pub reserve_r: u64,
     pub start_deadline_slot: u64,
     pub stall_timeout_slots: u64,
@@ -1134,19 +1179,31 @@ pub struct Session {
     pub next_permit_nonce: u64,
     pub bump: u8,
 
-    // Bid mode fields
+    // Bid/SLA fields
     pub is_bid: bool,
     pub premium_bps: u16,
+    pub fail_payout_bps: u16,
+    pub latency_target_ms: u16,
+    pub bandwidth_min_chunks: u32,
+    pub sla_warmup_slots: u64,
+    pub sla_window_slots: u64,
+    pub sla_window_start_slot: u64,
+    pub sla_window_end_slot: u64,
+
+    // Insurance split
+    pub base_coverage_p: u64,
     pub bid_coverage_p: u64,
     pub reserve_base: u64,
     pub reserve_bid: u64,
-    pub sla_window_start: u64,
-    pub sla_window_end: u64,
-    pub latency_target_ms: u32,
-    pub bandwidth_target_chunks: u64,
+
+    // SLA state
+    pub sla_status: SlaStatus,
+    pub sla_failure_reason: SlaFailureReason,
+    pub latency_attested: bool,
+
+    // Nonce tracking for bandwidth SLA
     pub nonce_at_window_start: u64,
     pub nonce_at_window_end: u64,
-    pub sla_status: SlaStatus,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, InitSpace)]
@@ -1162,8 +1219,16 @@ pub enum SessionState {
 pub enum SlaStatus {
     None,     // Not a bid session or SLA not yet active
     Pending,  // SLA evaluation pending
-    Passed,   // SLA requirements met
+    Met,      // SLA requirements met
     Failed,   // SLA requirements violated
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, InitSpace)]
+pub enum SlaFailureReason {
+    None,
+    Latency,
+    Bandwidth,
+    Both,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
@@ -1190,12 +1255,13 @@ pub struct SessionOpened {
     pub provider: Pubkey,
     pub mode_id: u32,
     pub max_spend: u64,
-    pub coverage_p: u64,
+    pub base_coverage_p: u64,
     pub reserve_r: u64,
     pub start_deadline_slot: u64,
     // Bid mode fields
     pub is_bid: bool,
     pub premium_bps: u16,
+    pub fail_payout_bps: u16,
     pub bid_coverage_p: u64,
     pub reserve_base: u64,
     pub reserve_bid: u64,
@@ -1242,9 +1308,15 @@ pub struct SlaEvaluated {
 pub struct LatencyAttestationSubmitted {
     pub session: Pubkey,
     pub verifier: Pubkey,
-    pub rtt_p90_ms: u32,
+    pub rtt_p90_ms: u16,
     pub measurement_window_start: u64,
     pub measurement_window_end: u64,
+}
+
+#[event]
+pub struct SlaFinalized {
+    pub session: Pubkey,
+    pub status: SlaStatus,
 }
 
 #[event]
@@ -1253,6 +1325,7 @@ pub struct SlaFailureClaimed {
     pub payout: u64,
     pub escrow_refunded: u64,
     pub remaining_reserve_released: u64,
+    pub failure_reason: SlaFailureReason,
 }
 
 #[event]
@@ -1333,8 +1406,12 @@ pub enum ErrorCode {
     WindowStartNotSnapshotted,
     #[msg("SLA not failed")]
     SlaNotFailed,
+    #[msg("SLA has failures")]
+    SlaHasFailures,
     #[msg("Invalid measurement window")]
     InvalidMeasurementWindow,
     #[msg("Verifier not authorized")]
     VerifierNotAuthorized,
+    #[msg("Latency already attested")]
+    LatencyAlreadyAttested,
 }
