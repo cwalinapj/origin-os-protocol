@@ -67,9 +67,13 @@ jobs:
       if: steps.cache-anchor.outputs.cache-hit != 'true'
       run: |
         cargo install --git https://github.com/coral-xyz/anchor avm --locked --force
-        export PATH="$HOME/.cargo/bin:$PATH"
         avm install ${{ env.ANCHOR_VERSION }}
         avm use ${{ env.ANCHOR_VERSION }}
+
+    - name: Add Anchor to PATH
+      run: |
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+        echo "$HOME/.avm/bin" >> $GITHUB_PATH
 
     # Build and test
     - name: Build with Cargo
