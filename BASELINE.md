@@ -2,6 +2,42 @@
 
 This document defines the immutable security baseline for Origin OS Protocol.
 
+## Guiding Invariants (MUST NOT REGRESS)
+
+These architectural invariants are fundamental to protocol security:
+
+### 1. Escrow-Only Settlement
+
+No running "total owed" balances. All payments require one-time permits.
+
+- Each permit is single-use (nonce-tracked)
+- Provider cannot claim without a valid, signed permit
+- No accumulating debt or credit between parties
+
+### 2. Mandatory Insurance
+
+Host collateral is reserved per session and slashed on objective failure.
+
+- `reserve_r` (or `reserve_base` + `reserve_bid`) is locked at session open
+- Collateral cannot be withdrawn while sessions are active
+- SLA failure triggers automatic slashing from reserved collateral
+
+### 3. Mint Consistency (v0)
+
+Session payment mint == insurance payout mint == collateral mint.
+
+- Single token type per session for simplicity
+- User pays in X, provider collateralizes in X, payouts in X
+- No cross-token complexity in v0
+
+### 4. Immutable Core Money Logic
+
+Escrow/vault/claims stay immutable; only registries/config are upgradeable (timelocked).
+
+- `session_escrow` and `collateral_vault` programs are non-upgradeable
+- `mode_registry` config changes require timelock
+- Gateway and helpers can be upgraded with standard governance
+
 ## Security-Critical Components
 
 The following components are **security-critical** and require elevated review processes:
