@@ -86,7 +86,7 @@ See `BUILD.md` for detailed setup instructions.
 ## Safe Zones for Autonomous Changes
 
 You MAY freely modify these areas:
-- `programs/gateway/` - Currently stub-only until pyth_helpers tests pass
+- `programs/gateway/` - Currently stub-only (placeholder implementations without actual swap logic) until pyth_helpers tests pass
 - `programs/pyth_helpers/` - Price utilities and tests
 - `tests/` - All test files
 - `*.md` - Documentation files
