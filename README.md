@@ -180,6 +180,8 @@ Atomic “gateway” flows (initially skeleton/stubs):
 
 ## Apps + LAM (How users interact)
 
+See: [docs/read.md](docs/read.md)
+
 ### What the LAM is
 The “LAM” is the AI helper users talk to inside the apps. It guides users through:
 - finding hosts
