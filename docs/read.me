@@ -1,0 +1,56 @@
+# How users interact with the Origin OS / RCDN LAM (in the apps)
+
+## What "LAM" is in this project
+The LAM is the AI helper users talk to inside ChatGPT. It guides users through actions (quoting sessions, finding hosts, preparing transactions, monitoring jobs) by calling **approved tools** exposed by our apps.
+
+## How users access the LAM
+1) **Enable the app**
+- Users connect the app from **ChatGPT → Settings → Apps** (or the app directory) and complete any login/authorization if required.  <a href="https://help.openai.com/en/articles/11487775-connectors-in-chatgpt?utm_source=chatgpt.com">oai_citation:0‡OpenAI Help Center</a>  
+- In Business/Enterprise/Edu workspaces, admins may control which apps are enabled and who can use them.  <a href="https://help.openai.com/en/articles/11509118-admin-controls-security-and-compliance-in-apps-connectors-enterprise-edu-and-business?_bhlid=53d357b4b6c8333b3394badd97aa24fd8b8da695&amp;utm_source=chatgpt.com">oai_citation:1‡OpenAI Help Center</a>
+
+2) **Use it in chat**
+Once enabled, users can invoke the app (and therefore the LAM) inside any ChatGPT conversation by:
+- **@mentioning** the app in the prompt, or
+- clicking **+ → More** and selecting the app.  <a href="https://help.openai.com/en/articles/11487775-connectors-in-chatgpt?utm_source=chatgpt.com">oai_citation:2‡OpenAI Help Center</a>
+
+## What happens when the user chats
+When a user asks for something (e.g., "find a host under 40ms" or "quote an Ask-mode SLA"), the LAM:
+1) Interprets the request in natural language
+2) Calls our app's **tools** (via MCP) to fetch data or prepare actions
+3) Returns results as text + UI (tables, buttons, next steps)
+4) For any action that moves funds or changes on-chain state, the user must confirm/sign (wallet or auth), depending on role.
+
+Apps are built on the **Model Context Protocol (MCP)** so ChatGPT can call approved tools and retrieve information from our services.  <a href="https://help.openai.com/en/articles/11487775-connectors-in-chatgpt?utm_source=chatgpt.com">oai_citation:3‡OpenAI Help Center</a>
+
+## Tool safety: why interactions are reliable
+Our tools use **structured schemas** so the model's tool arguments match the required JSON format (reduces "wrong shape" requests). We use Structured Outputs (`strict: true`) for tool calls where applicable.  <a href="https://openai.com/index/introducing-structured-outputs-in-the-api/?utm_source=chatgpt.com">oai_citation:4‡OpenAI</a>
+
+## Typical user flows (examples)
+
+### Client (buyer) flow
+- "Find me a host near me with low latency"
+- App tools return host directory + probe results
+- "Quote a session with X replicas and Y days"
+- App returns required escrow + required collateral + SLA terms
+- "Build the transaction"
+- App returns a tx payload; user signs/sends
+
+### Host (provider) flow
+- "What collateral do I need to accept this contract?"
+- App computes reserve requirements and risk exposure
+- "Register my node + stake collateral"
+- App builds tx; user signs
+- "Show my active sessions + earnings"
+- App reads on-chain state + local agent health
+
+### Verifier/Admin flow
+- "Run a latency attestation for this host/session"
+- Verifier tool runs probes and submits signed attestation
+- Admin tools update allowlists, oracle feeds, or mode params (restricted access)
+
+## Roles and access control
+- Client + Host tools are available to normal users (wallet signing required for tx execution).
+- Admin tools are restricted and may require workspace controls + stronger auth.  <a href="https://help.openai.com/en/articles/11509118-admin-controls-security-and-compliance-in-apps-connectors-enterprise-edu-and-business?_bhlid=53d357b4b6c8333b3394badd97aa24fd8b8da695&amp;utm_source=chatgpt.com">oai_citation:5‡OpenAI Help Center</a>
+
+## Notes
+- Voice mode may not support apps in ChatGPT (UI/tooling flows are chat-first).  <a href="https://help.openai.com/en/articles/11487775-connectors-in-chatgpt?utm_source=chatgpt.com">oai_citation:6‡OpenAI Help Center</a>
