@@ -82,19 +82,12 @@ jobs:
   # Security check for dependency vulnerabilities
   security-audit:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
-
-      - name: Run Security Audit
-        run: cargo audit
-        continue-on-error: true  # Don't fail on advisories, just report
+      - name: Audit Rust Dependencies
+        uses: actions-rust-lang/audit@v1
