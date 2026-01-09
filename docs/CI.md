@@ -103,7 +103,7 @@ As the project evolves, consider:
 
 ### CI Fails on Anchor Install
 - Check that Anchor version matches in both workflow and `Anchor.toml`
-- Verify Solana version compatibility (Anchor 0.30.1 requires Solana 1.18.x)
+- Verify Solana version compatibility (Anchor 0.30.1 requires Solana 1.18.x series, specifically tested with 1.18.0-1.18.26)
 
 ### CI Fails on Anchor Test
 - Ensure all Node dependencies are properly specified in `package.json`

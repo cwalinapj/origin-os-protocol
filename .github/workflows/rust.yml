@@ -43,7 +43,7 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.local/share/solana/install
-        key: solana-${{ env.SOLANA_VERSION }}
+        key: solana-${{ runner.os }}-${{ env.SOLANA_VERSION }}
 
     - name: Install Solana
       if: steps.cache-solana.outputs.cache-hit != 'true'
@@ -58,13 +58,16 @@ jobs:
       id: cache-anchor
       uses: actions/cache@v4
       with:
-        path: ~/.cargo/bin/anchor
-        key: anchor-${{ env.ANCHOR_VERSION }}
+        path: |
+          ~/.cargo/bin/avm
+          ~/.cargo/bin/anchor
+        key: anchor-${{ runner.os }}-${{ env.ANCHOR_VERSION }}
 
     - name: Install Anchor CLI
       if: steps.cache-anchor.outputs.cache-hit != 'true'
       run: |
         cargo install --git https://github.com/coral-xyz/anchor avm --locked --force
+        export PATH="$HOME/.cargo/bin:$PATH"
         avm install ${{ env.ANCHOR_VERSION }}
         avm use ${{ env.ANCHOR_VERSION }}
 
