@@ -55,9 +55,18 @@ jobs:
       # Solana CLI pinned: install tool supports specifying a release tag
       - name: Install Solana CLI (pinned)
         run: |
-          sh -c "$(curl -sSfL https://release.solana.com/v1.18.26/install)"
-          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
-          solana --version
+    set -euxo pipefail
+
+    sudo apt-get update
+    sudo apt-get install -y ca-certificates curl
+    sudo update-ca-certificates
+
+    curl --proto '=https' --tlsv1.2 -fL \
+      --retry 8 --retry-all-errors --retry-delay 2 \
+      https://release.solana.com/v1.18.26/install | bash
+
+    echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+    solana --version
       # Solana docs show install via release.solana.com/<version>/install and note you can replace the version tag.  [oai_citation:2‡Solana Validator](https://docs.solanalabs.com/cli/install?utm_source=chatgpt.com)
 
       # Anchor CLI via AVM (pin to 0.30.1)
