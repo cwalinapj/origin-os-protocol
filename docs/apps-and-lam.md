@@ -235,6 +235,14 @@ async function handleCalculateInsurance(args: any) {
   
   // Fetch mode config
   const program = anchor.workspace.ModeRegistry;
+  const [registryPda] = await PublicKey.findProgramAddress(
+    [Buffer.from("registry")],
+    program.programId
+  );
+  const [modePda] = await PublicKey.findProgramAddress(
+    [Buffer.from("mode"), registryPda.toBuffer(), new anchor.BN(modeId).toArrayLike(Buffer, "le", 2)],
+    program.programId
+  );
   const mode = await program.account.mode.fetch(modePda);
   
   // Insurance formula
@@ -273,6 +281,9 @@ async function handleBuildOpenSessionTx(args: any) {
   const program = anchor.workspace.SessionEscrow;
   const user = new PublicKey(userPubkey);
   const providerKey = new PublicKey(provider);
+  
+  // Generate a nonce for this session (in practice, fetch from user's account)
+  const nonce = Date.now(); // Or use an incrementing counter from on-chain state
   
   // Derive PDAs
   const [sessionPda] = await PublicKey.findProgramAddress(
