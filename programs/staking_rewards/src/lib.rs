@@ -14,6 +14,84 @@ pub mod staking_rewards {
     pub const EMISSION_RATE_PER_SLOT: u64 = 1_000_000;
     pub const RESERVED_WEIGHT_BPS: u64 = 8000;
     pub const FREE_WEIGHT_BPS: u64 = 2000;
+    pub const MAX_BPS: u16 = 10_000;
+
+    /// Initialize the emission controller (must be called first)
+    pub fn init_emission_controller(
+        ctx: Context<InitEmissionController>,
+        global_rate_per_slot: u64,
+        nft_pool_weight_bps: u16,
+        native_pool_weight_bps: u16,
+        emission_cap: u128,
+    ) -> Result<()> {
+        // Validate weights sum to ≤10000 bps
+        let total_weight = nft_pool_weight_bps
+            .checked_add(native_pool_weight_bps)
+            .ok_or(ErrorCode::Overflow)?;
+        require!(total_weight <= MAX_BPS, ErrorCode::InvalidWeights);
+
+        let controller = &mut ctx.accounts.emission_controller;
+        let clock = Clock::get()?;
+
+        controller.authority = ctx.accounts.authority.key();
+        controller.pending_authority = Pubkey::default();
+        controller.reward_mint = ctx.accounts.reward_mint.key();
+        controller.global_rate_per_slot = global_rate_per_slot;
+        controller.nft_pool_weight_bps = nft_pool_weight_bps;
+        controller.native_pool_weight_bps = native_pool_weight_bps;
+        controller.total_emitted = 0;
+        controller.emission_cap = emission_cap;
+        controller.last_update_slot = clock.slot;
+        controller.last_rate_change_slot = clock.slot;
+        controller.paused = false;
+        controller.bump = ctx.bumps.emission_controller;
+
+        emit!(EmissionControllerInitialized {
+            authority: controller.authority,
+            reward_mint: controller.reward_mint,
+            global_rate_per_slot,
+            nft_pool_weight_bps,
+            native_pool_weight_bps,
+        });
+
+        Ok(())
+    }
+
+    /// Update emission weights (authority only)
+    pub fn update_emission_weights(
+        ctx: Context<UpdateEmissionController>,
+        nft_pool_weight_bps: u16,
+        native_pool_weight_bps: u16,
+    ) -> Result<()> {
+        let total_weight = nft_pool_weight_bps
+            .checked_add(native_pool_weight_bps)
+            .ok_or(ErrorCode::Overflow)?;
+        require!(total_weight <= MAX_BPS, ErrorCode::InvalidWeights);
+
+        let controller = &mut ctx.accounts.emission_controller;
+        let clock = Clock::get()?;
+
+        controller.nft_pool_weight_bps = nft_pool_weight_bps;
+        controller.native_pool_weight_bps = native_pool_weight_bps;
+        controller.last_rate_change_slot = clock.slot;
+
+        emit!(EmissionWeightsUpdated {
+            nft_pool_weight_bps,
+            native_pool_weight_bps,
+        });
+
+        Ok(())
+    }
+
+    /// Pause/unpause emissions (authority only)
+    pub fn set_emission_paused(
+        ctx: Context<UpdateEmissionController>,
+        paused: bool,
+    ) -> Result<()> {
+        ctx.accounts.emission_controller.paused = paused;
+        emit!(EmissionPausedUpdated { paused });
+        Ok(())
+    }
 
     /// Initialize the staking pool
     pub fn initialize_pool(ctx: Context<InitializePool>) -> Result<()> {
@@ -332,6 +410,38 @@ fn calculate_pending_rewards(pool: &StakingPool, stake: &StakeAccount) -> Result
 // ============================================================================
 
 #[derive(Accounts)]
+pub struct InitEmissionController<'info> {
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + EmissionController::INIT_SPACE,
+        seeds = [b"emission_controller"],
+        bump
+    )]
+    pub emission_controller: Account<'info, EmissionController>,
+
+    pub reward_mint: Account<'info, Mint>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateEmissionController<'info> {
+    #[account(
+        mut,
+        seeds = [b"emission_controller"],
+        bump = emission_controller.bump,
+        has_one = authority @ ErrorCode::Unauthorized
+    )]
+    pub emission_controller: Account<'info, EmissionController>,
+
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct InitializePool<'info> {
     #[account(
         init,
@@ -484,6 +594,23 @@ pub struct UnstakePosition<'info> {
 
 #[account]
 #[derive(InitSpace)]
+pub struct EmissionController {
+    pub authority: Pubkey,
+    pub pending_authority: Pubkey,      // 2-step authority transfer
+    pub reward_mint: Pubkey,
+    pub global_rate_per_slot: u64,      // Total emissions per slot
+    pub nft_pool_weight_bps: u16,       // e.g. 7000 = 70%
+    pub native_pool_weight_bps: u16,    // e.g. 3000 = 30%
+    pub total_emitted: u128,            // Running total
+    pub emission_cap: u128,             // Max total supply
+    pub last_update_slot: u64,
+    pub last_rate_change_slot: u64,     // When rate was last changed
+    pub paused: bool,                   // Emergency stop
+    pub bump: u8,
+}
+
+#[account]
+#[derive(InitSpace)]
 pub struct StakingPool {
     pub authority: Pubkey,
     pub reward_mint: Pubkey,
@@ -522,6 +649,26 @@ pub struct CollateralPosition {
 // ============================================================================
 // Events
 // ============================================================================
+
+#[event]
+pub struct EmissionControllerInitialized {
+    pub authority: Pubkey,
+    pub reward_mint: Pubkey,
+    pub global_rate_per_slot: u64,
+    pub nft_pool_weight_bps: u16,
+    pub native_pool_weight_bps: u16,
+}
+
+#[event]
+pub struct EmissionWeightsUpdated {
+    pub nft_pool_weight_bps: u16,
+    pub native_pool_weight_bps: u16,
+}
+
+#[event]
+pub struct EmissionPausedUpdated {
+    pub paused: bool,
+}
 
 #[event]
 pub struct PoolInitialized {
@@ -569,4 +716,10 @@ pub enum ErrorCode {
     NoRewardsToClaim,
     #[msg("Wrong owner")]
     WrongOwner,
+    #[msg("Invalid weights: must sum to <= 10000 bps")]
+    InvalidWeights,
+    #[msg("Unauthorized")]
+    Unauthorized,
+    #[msg("Emissions paused")]
+    EmissionsPaused,
 }

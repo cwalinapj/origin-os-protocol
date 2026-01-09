@@ -6,6 +6,7 @@ members = [
     "programs/staking_rewards",
     "programs/gateway",
     "programs/pyth_helpers",
+    "programs/naked_staking",
 ]
 resolver = "2"
 

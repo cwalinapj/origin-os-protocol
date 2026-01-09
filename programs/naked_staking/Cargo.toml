@@ -1,0 +1,21 @@
+[package]
+name = "naked-staking"
+version = "0.1.0"
+description = "Naked staking for protocol native token without provider NFT"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "naked_staking"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+
+[dependencies]
+anchor-lang = "0.30.1"
+anchor-spl = "0.30.1"
+pyth-solana-receiver-sdk = "0.3.0"
