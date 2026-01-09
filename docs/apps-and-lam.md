@@ -283,10 +283,14 @@ async function handleBuildOpenSessionTx(args: any) {
   const user = new PublicKey(userPubkey);
   const providerKey = new PublicKey(provider);
   
-  // Generate a nonce for this session
-  // NOTE: In production, fetch the user's current nonce from an on-chain counter
-  // to prevent collisions. Date.now() is shown here for simplicity only.
-  const nonce = Date.now();
+  // IMPORTANT: In production, fetch the user's current nonce from an on-chain counter
+  // to ensure uniqueness and prevent collisions. For example:
+  // const userAccount = await program.account.userState.fetch(userStatePda);
+  // const nonce = userAccount.sessionNonce.toNumber();
+  // 
+  // This example shows a simple approach for demonstration:
+  const crypto = require('crypto');
+  const nonce = crypto.randomBytes(8).readBigUInt64LE();
   
   // Derive PDAs
   const [sessionPda] = await PublicKey.findProgramAddress(
