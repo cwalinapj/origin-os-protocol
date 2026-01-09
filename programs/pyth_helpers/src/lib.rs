@@ -73,10 +73,9 @@ pub fn load_price(
     })
 }
 
-/// Assert price is fresh (within max_age_seconds)
-pub fn assert_fresh(publish_time: i64, max_age_seconds: u64) -> Result<()> {
-    let clock = Clock::get()?;
-    let age = clock.unix_timestamp.saturating_sub(publish_time);
+/// Assert price is fresh using provided clock time (useful for testing)
+pub fn assert_fresh_at(publish_time: i64, current_timestamp: i64, max_age_seconds: u64) -> Result<()> {
+    let age = current_timestamp.saturating_sub(publish_time);
     
     require!(
         age >= 0 && (age as u64) <= max_age_seconds,
@@ -84,6 +83,12 @@ pub fn assert_fresh(publish_time: i64, max_age_seconds: u64) -> Result<()> {
     );
     
     Ok(())
+}
+
+/// Assert price is fresh (within max_age_seconds)
+pub fn assert_fresh(publish_time: i64, max_age_seconds: u64) -> Result<()> {
+    let clock = Clock::get()?;
+    assert_fresh_at(publish_time, clock.unix_timestamp, max_age_seconds)
 }
 
 /// Assert confidence is within acceptable ratio
@@ -200,24 +205,33 @@ pub fn usd_to_token_amount(
 ) -> Result<u64> {
     require!(price_data.price > 0, PythError::InvalidPrice);
     
-    // USD value in smallest units * 10^token_decimals / price
-    let exp_adjustment = (token_decimals as i32) - (usd_decimals as i32) + price_data.exponent;
-    
-    let result = if exp_adjustment >= 0 {
-        (usd_value as u128)
-            .checked_mul(10u128.pow(exp_adjustment as u32))
-            .ok_or(error!(PythError::Overflow))?
-            .checked_div(price_data.price.unsigned_abs() as u128)
-            .ok_or(error!(PythError::Overflow))?
+    let price = price_data.price.unsigned_abs() as u128;
+    let mut numerator = usd_value as u128;
+    let mut denominator = price;
+
+    numerator = numerator
+        .checked_mul(10u128.pow(token_decimals as u32))
+        .ok_or(error!(PythError::Overflow))?;
+
+    // price exponent is applied in the denominator when positive, numerator when negative
+    if price_data.exponent < 0 {
+        numerator = numerator
+            .checked_mul(10u128.pow((-price_data.exponent) as u32))
+            .ok_or(error!(PythError::Overflow))?;
+        denominator = denominator
+            .checked_mul(10u128.pow(usd_decimals as u32))
+            .ok_or(error!(PythError::Overflow))?;
     } else {
-        (usd_value as u128)
-            .checked_div(price_data.price.unsigned_abs() as u128)
+        denominator = denominator
+            .checked_mul(10u128.pow(price_data.exponent as u32))
             .ok_or(error!(PythError::Overflow))?
-            .checked_div(10u128.pow((-exp_adjustment) as u32))
-            .ok_or(error!(PythError::Overflow))?
-    };
+            .checked_mul(10u128.pow(usd_decimals as u32))
+            .ok_or(error!(PythError::Overflow))?;
+    }
     
-    Ok(result as u64)
+    Ok(numerator
+        .checked_div(denominator)
+        .ok_or(error!(PythError::Overflow))? as u64)
 }
 
 /// Convert token amount to USD value using price
@@ -229,24 +243,29 @@ pub fn token_amount_to_usd(
 ) -> Result<u64> {
     require!(price_data.price > 0, PythError::InvalidPrice);
     
-    // token_amount * price / 10^(token_decimals - usd_decimals + exponent)
-    let exp_adjustment = (token_decimals as i32) - (usd_decimals as i32) + price_data.exponent;
-    
-    let result = if exp_adjustment >= 0 {
-        (token_amount as u128)
-            .checked_mul(price_data.price.unsigned_abs() as u128)
-            .ok_or(error!(PythError::Overflow))?
-            .checked_div(10u128.pow(exp_adjustment as u32))
-            .ok_or(error!(PythError::Overflow))?
+    let price = price_data.price.unsigned_abs() as u128;
+    let mut numerator = token_amount as u128;
+    let mut denominator = 10u128.pow(token_decimals as u32);
+
+    numerator = numerator
+        .checked_mul(price)
+        .ok_or(error!(PythError::Overflow))?
+        .checked_mul(10u128.pow(usd_decimals as u32))
+        .ok_or(error!(PythError::Overflow))?;
+
+    if price_data.exponent < 0 {
+        denominator = denominator
+            .checked_mul(10u128.pow((-price_data.exponent) as u32))
+            .ok_or(error!(PythError::Overflow))?;
     } else {
-        (token_amount as u128)
-            .checked_mul(price_data.price.unsigned_abs() as u128)
-            .ok_or(error!(PythError::Overflow))?
-            .checked_mul(10u128.pow((-exp_adjustment) as u32))
-            .ok_or(error!(PythError::Overflow))?
-    };
-    
-    Ok(result as u64)
+        numerator = numerator
+            .checked_mul(10u128.pow(price_data.exponent as u32))
+            .ok_or(error!(PythError::Overflow))?;
+    }
+
+    Ok(numerator
+        .checked_div(denominator)
+        .ok_or(error!(PythError::Overflow))? as u64)
 }
 
 #[error_code]
@@ -500,6 +519,32 @@ mod tests {
     }
 
     #[test]
+    fn test_conservative_min_out_applies_confidence_and_slippage() {
+        let price_in = PriceData {
+            price: 200,
+            conf: 10,
+            exponent: -2,
+            publish_time: 0,
+        };
+        let price_out = PriceData {
+            price: 100,
+            conf: 10,
+            exponent: -2,
+            publish_time: 0,
+        };
+
+        let amount_in = 1_000_000u64;
+        let slippage_bps = 500; // 5%
+
+        // sell_price = 200 - 10 = 190
+        // buy_price  = 100 + 10 = 110
+        // min_out before slippage = floor(1_000_000 * 190 / 110) = 1_727_272
+        // after 5% slippage => floor(1_727_272 * 0.95) = 1_640_908
+        let min_out = conservative_min_out(amount_in, &price_in, &price_out, slippage_bps).unwrap();
+        assert_eq!(min_out, 1_640_908);
+    }
+
+    #[test]
     fn test_conservative_min_out_invalid_price_in() {
         let price_in = PriceData {
             price: 0, // Invalid
@@ -614,18 +659,32 @@ mod tests {
     }
 
     // ==================== Staleness Tests (assert_fresh logic) ====================
-    // Note: assert_fresh requires Clock::get() which needs Solana runtime.
-    // These tests document the expected behavior; integration tests cover actual execution.
+    #[test]
+    fn test_assert_fresh_at_accepts_recent() {
+        let publish_time = 1_000;
+        let current_time = 1_005;
+        let max_age = 10;
 
-    // The staleness check in assert_fresh:
-    // 1. Gets current unix_timestamp from Clock
-    // 2. Calculates age = current_time - publish_time
-    // 3. Requires age >= 0 AND age <= max_age_seconds
-    // 4. Returns PythError::PriceTooOld if stale
+        assert!(assert_fresh_at(publish_time, current_time, max_age).is_ok());
+    }
 
-    // Integration test scenarios that should be covered:
-    // - Fresh price (publish_time = now) -> OK
-    // - Price exactly at max_age -> OK
-    // - Price 1 second over max_age -> PriceTooOld error
-    // - Future price (publish_time > now) -> age < 0 -> PriceTooOld error
+    #[test]
+    fn test_assert_fresh_at_rejects_stale() {
+        let publish_time = 1_000;
+        let current_time = 1_011; // 11s later, over max_age 10
+        let max_age = 10;
+
+        let result = assert_fresh_at(publish_time, current_time, max_age);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_assert_fresh_at_rejects_future_timestamp() {
+        let publish_time = 1_010; // future relative to current_time
+        let current_time = 1_000;
+        let max_age = 10;
+
+        let result = assert_fresh_at(publish_time, current_time, max_age);
+        assert!(result.is_err());
+    }
 }
