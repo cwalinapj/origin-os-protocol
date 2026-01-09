@@ -1,0 +1,16 @@
+[package]
+name = "pyth_helpers"
+version = "0.1.0"
+description = "Shared Pyth oracle utilities for Origin OS Protocol"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "pyth_helpers"
+
+[features]
+default = []
+
+[dependencies]
+anchor-lang = "0.30.1"
+pyth-solana-receiver-sdk = "0.4.0"

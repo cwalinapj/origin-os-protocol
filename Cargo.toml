@@ -4,6 +4,8 @@ members = [
     "programs/collateral_vault",
     "programs/session_escrow",
     "programs/staking_rewards",
+    "programs/gateway",
+    "programs/pyth_helpers",
 ]
 resolver = "2"
 
