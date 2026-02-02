@@ -7,6 +7,15 @@ This protocol is built around an **escrow-only** settlement model:
 - Providers lock collateral in the same mint
 - Providers can only withdraw via **one-time signed permits**
 - Objective, on-chain claim conditions can slash reserved collateral to pay insurance
+
+## Security Invariants
+- `mode_registry` changes cannot move funds (only blocks new activity)
+- Immutable money core: `collateral_vault` and `session_escrow` are not upgradeable
+- Objective claims only (no subjective adjudication in v1)
+- Payment mint == collateral mint == insurance mint per session
+- Provider cannot withdraw without valid permit
+- Permits are one-time (nonce tracking)
+- Reserved collateral backs all active sessions
 │                           ORIGIN OS PROTOCOL                                 │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
@@ -235,4 +244,3 @@ anchor test
 
 # Deploy to devnet
 anchor deploy --provider.cluster devnet
-
