@@ -1,0 +1,14 @@
+[package]
+name = "constant_time_eq"
+version = "0.4.2"
+edition = "2021"
+description = "Constant time equality check"
+license = "CC0-1.0"
+repository = "https://github.com/ctz/constant_time_eq"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+std = []
